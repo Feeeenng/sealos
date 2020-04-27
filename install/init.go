@@ -2,6 +2,8 @@ package install
 
 import (
 	"fmt"
+	"github.com/fanux/sealos/cert"
+	"github.com/fanux/sealos/net"
 	"github.com/wonderivan/logger"
 	"io/ioutil"
 	"os"
@@ -9,23 +11,36 @@ import (
 
 //BuildInit is
 func BuildInit() {
-	hosts := append(Masters, Nodes...)
+	MasterIPs = ParseIPs(MasterIPs)
+	NodeIPs = ParseIPs(NodeIPs)
+	// 所有master节点
+	masters := MasterIPs
+	// 所有node节点
+	nodes := NodeIPs
+	hosts := append(masters, nodes...)
 	i := &SealosInstaller{
-		Hosts: hosts,
+		Hosts:   hosts,
+		Masters: masters,
+		Nodes:   nodes,
 	}
 	i.CheckValid()
 	i.Print()
-	i.SendPackage("kube")
+	i.SendPackage()
 	i.Print("SendPackage")
 	i.KubeadmConfigInstall()
 	i.Print("SendPackage", "KubeadmConfigInstall")
+	i.GenerateCert()
+	//生成kubeconfig的时候kubeadm的kubeconfig阶段会检查硬盘是否kubeconfig，有则跳过
+	//不用kubeadm init加选项跳过[kubeconfig]的阶段
+	i.CreateKubeconfig()
+
 	i.InstallMaster0()
 	i.Print("SendPackage", "KubeadmConfigInstall", "InstallMaster0")
-	if len(Masters) > 1 {
-		i.JoinMasters()
+	if len(masters) > 1 {
+		i.JoinMasters(i.Masters[1:])
 		i.Print("SendPackage", "KubeadmConfigInstall", "InstallMaster0", "JoinMasters")
 	}
-	if len(Nodes) > 0 {
+	if len(nodes) > 0 {
 		i.JoinNodes()
 		i.Print("SendPackage", "KubeadmConfigInstall", "InstallMaster0", "JoinMasters", "JoinNodes")
 	}
@@ -50,26 +65,85 @@ func (s *SealosInstaller) KubeadmConfigInstall() {
 		templateData = string(TemplateFromTemplateContent(string(fileData)))
 	}
 	cmd := "echo \"" + templateData + "\" > /root/kubeadm-config.yaml"
-	Cmd(Masters[0], cmd)
+	_ = SSHConfig.CmdAsync(s.Masters[0], cmd)
+	//读取模板数据
+	kubeadm := KubeadmDataFromYaml(templateData)
+	if kubeadm != nil {
+		DnsDomain = kubeadm.Networking.DnsDomain
+		ApiServerCertSANs = kubeadm.ApiServer.CertSANs
+	} else {
+		logger.Warn("decode certSANs from config failed, using default SANs")
+		ApiServerCertSANs = getDefaultSANs()
+	}
+}
+
+func getDefaultSANs() []string {
+	var sans = []string{"127.0.0.1", "apiserver.cluster.local", VIP}
+	for _, master := range MasterIPs {
+		sans = append(sans, IpFormat(master))
+	}
+	return sans
+}
+
+func (s *SealosInstaller) GenerateCert() {
+	//cert generator in sealos
+	hostname := GetRemoteHostName(s.Masters[0])
+	cert.GenerateCert(CertPath, CertEtcdPath, ApiServerCertSANs, IpFormat(s.Masters[0]), hostname, SvcCIDR, DnsDomain)
+	//copy all cert to master0
+	//CertSA(kye,pub) + CertCA(key,crt)
+	s.sendCaAndKey([]string{s.Masters[0]})
+	s.sendCerts([]string{s.Masters[0]})
+}
+
+func (s *SealosInstaller) CreateKubeconfig() {
+	hostname := GetRemoteHostName(s.Masters[0])
+
+	certConfig := cert.Config{
+		Path:     cert.KubeDefaultCertPath,
+		BaseName: "ca",
+	}
+
+	controlPlaneEndpoint := fmt.Sprintf("https://%s:6443", ApiServer)
+
+	err := cert.CreateJoinControlPlaneKubeConfigFiles(cert.KubernetesDir,
+		certConfig, hostname, controlPlaneEndpoint, "kubernetes")
+	if err != nil {
+		logger.Error("generator kubeconfig failed %s", err)
+		os.Exit(-1)
+	}
+
 }
 
 //InstallMaster0 is
 func (s *SealosInstaller) InstallMaster0() {
-	cmd := fmt.Sprintf("echo %s %s >> /etc/hosts", IpFormat(Masters[0]), ApiServer)
-	Cmd(Masters[0], cmd)
+	//master0 do sth
+	cmd := fmt.Sprintf("echo %s %s >> /etc/hosts", IpFormat(s.Masters[0]), ApiServer)
+	_ = SSHConfig.CmdAsync(s.Masters[0], cmd)
 
 	cmd = s.Command(Version, InitMaster)
 
-	output := Cmd(Masters[0], cmd)
+	output := SSHConfig.Cmd(s.Masters[0], cmd)
 	if output == nil {
-		logger.Error("[%s]kubernetes install is error.please clean and uninstall.", Masters[0])
+		logger.Error("[%s]kubernetes install is error.please clean and uninstall.", s.Masters[0])
 		os.Exit(1)
 	}
 	decodeOutput(output)
 
 	cmd = `mkdir -p /root/.kube && cp /etc/kubernetes/admin.conf /root/.kube/config`
-	output = Cmd(Masters[0], cmd)
+	output = SSHConfig.Cmd(s.Masters[0], cmd)
 
-	cmd = `kubectl apply -f /root/kube/conf/net/calico.yaml || true`
-	output = Cmd(Masters[0], cmd)
+	if WithoutCNI {
+		logger.Info("--without-cni is true, so we not install calico or flannel, install it by yourself")
+		return
+	}
+	//cmd = `kubectl apply -f /root/kube/conf/net/calico.yaml || true`
+	netyaml := net.NewNetwork(Network, net.MetaData{
+		Interface: Interface,
+		CIDR:      PodCIDR,
+		IPIP:      IPIP,
+		MTU:       MTU,
+	}).Manifests("")
+
+	cmd = fmt.Sprintf(`echo '%s' | kubectl apply -f -`, netyaml)
+	output = SSHConfig.Cmd(s.Masters[0], cmd)
 }
